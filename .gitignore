@@ -1,0 +1,9 @@
+# Local settings and generated test data
+/tests/scratch/
+/work/
+config.json
+config.json.bak
+journal.log*
+*.tmp
+*.pdb
+.vs/
