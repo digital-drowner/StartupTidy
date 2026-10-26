@@ -30,4 +30,12 @@ if errorlevel 1 exit /b 1
 "%TIDY_CSC%" /nologo /target:exe /main:LayoutRegression /out:scratch\LayoutRegression.exe /resource:..\assets\app.ico,StartupTidy.App.ico /resource:..\assets\tray-inactive.ico,StartupTidy.Inactive.ico /resource:..\assets\tray-active.ico,StartupTidy.Active.ico /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Runtime.Serialization.dll ..\StartupTidy.cs ..\Theme.cs LayoutRegression.cs
 if errorlevel 1 exit /b 1
 scratch\LayoutRegression.exe "%CD%\scratch"
+if errorlevel 1 exit /b 1
+"%TIDY_CSC%" /nologo /target:exe /main:ImportantRegression /out:scratch\ImportantRegression.exe /resource:..\assets\app.ico,StartupTidy.App.ico /resource:..\assets\tray-inactive.ico,StartupTidy.Inactive.ico /resource:..\assets\tray-active.ico,StartupTidy.Active.ico /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Runtime.Serialization.dll ..\StartupTidy.cs ..\Theme.cs ImportantRegression.cs
+if errorlevel 1 exit /b 1
+scratch\ImportantRegression.exe "%CD%\scratch"
+if errorlevel 1 exit /b 1
+"%TIDY_CSC%" /nologo /target:exe /main:PickerFilterRegression /out:scratch\PickerFilterRegression.exe /resource:..\assets\app.ico,StartupTidy.App.ico /resource:..\assets\tray-inactive.ico,StartupTidy.Inactive.ico /resource:..\assets\tray-active.ico,StartupTidy.Active.ico /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Runtime.Serialization.dll ..\StartupTidy.cs ..\Theme.cs PickerFilterRegression.cs
+if errorlevel 1 exit /b 1
+scratch\PickerFilterRegression.exe "%CD%\scratch"
 exit /b %errorlevel%

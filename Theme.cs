@@ -21,7 +21,7 @@ namespace StartupTidy
         }
         internal static void Apply(Control control,bool dark)
         {
-            bool surface = control is TabPage || control is ListView || control is TextBoxBase || control is NumericUpDown;
+            bool surface = control is TabPage || control is ListView || control is TextBoxBase || control is NumericUpDown || control is ComboBox;
             control.BackColor=dark?(surface?Surface:Background):(control is Form?Color.FromArgb(246,248,251):surface?Color.White:Color.FromArgb(246,248,251));
             control.ForeColor=dark?Text:Color.FromArgb(32,40,50);
             var label=control as Label;
@@ -37,6 +37,7 @@ namespace StartupTidy
             }
             var checkbox=control as CheckBox;
             if(checkbox!=null){checkbox.FlatStyle=dark?FlatStyle.Flat:FlatStyle.Standard;checkbox.UseVisualStyleBackColor=false;}
+            var combo=control as ThemedComboBox;if(combo!=null){combo.Dark=dark;combo.FlatStyle=dark?FlatStyle.Flat:FlatStyle.Standard;}
             var numeric=control as NumericUpDown;
             if(numeric!=null) numeric.BorderStyle=BorderStyle.FixedSingle;
             var list=control as ThemedListView;
@@ -44,7 +45,7 @@ namespace StartupTidy
             {
                 list.Dark=dark; list.BorderStyle=dark?BorderStyle.None:BorderStyle.FixedSingle;
                 foreach(ListViewItem item in list.Items)
-                { var rule=item.Tag as Rule;item.ForeColor=rule!=null && Safety.Rejection(rule.Path)!=null ? (dark?Color.FromArgb(255,161,151):Color.DarkRed) : control.ForeColor; }
+                { var rule=item.Tag as Rule;item.ForeColor=rule!=null && Safety.RuleImportance(rule)!=null ? (dark?Color.FromArgb(255,196,132):Color.FromArgb(143,76,23)) : control.ForeColor; }
             }
             var tabs=control as ThemedTabs;if(tabs!=null)tabs.Dark=dark;
             foreach(Control child in control.Controls)Apply(child,dark);
@@ -63,6 +64,21 @@ namespace StartupTidy
             public override Color MenuItemBorder{get{return Mint;}}
             public override Color MenuBorder{get{return Border;}}
             public override Color SeparatorDark{get{return Border;}}
+        }
+    }
+    internal class ThemedComboBox:ComboBox
+    {
+        internal bool Dark;
+        public ThemedComboBox()
+        {
+            DrawMode=DrawMode.OwnerDrawFixed;
+            DrawItem+=delegate(object sender,DrawItemEventArgs e)
+            {
+                bool selected=(e.State & DrawItemState.Selected)!=0;
+                using(var brush=new SolidBrush(Dark?(selected?Theme.Selected:Theme.Surface):(selected?SystemColors.Highlight:Color.White)))e.Graphics.FillRectangle(brush,e.Bounds);
+                string text=e.Index>=0?GetItemText(Items[e.Index]):Text;
+                TextRenderer.DrawText(e.Graphics,text,Font,e.Bounds,Dark?Theme.Text:selected?SystemColors.HighlightText:SystemColors.ControlText,TextFormatFlags.VerticalCenter|TextFormatFlags.EndEllipsis|TextFormatFlags.NoPrefix);
+            };
         }
     }
     internal class ThemedTabs:TabControl

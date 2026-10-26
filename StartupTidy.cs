@@ -14,8 +14,8 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyVersion("1.2.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.1.0")]
 
 namespace StartupTidy
 {
@@ -24,6 +24,8 @@ namespace StartupTidy
         [DataMember] public string Path = "";
         [DataMember] public bool Enabled = true;
         [DataMember] public bool Force = false;
+        [DataMember] public bool RiskAccepted = false;
+        [DataMember] public string ImportantReason = "";
     }
     [DataContract] public class Settings
     {
@@ -35,7 +37,7 @@ namespace StartupTidy
         public Settings Copy()
         {
             return new Settings { IntervalSeconds = IntervalSeconds, DurationMinutes = DurationMinutes,
-                Continuous = Continuous, DarkTheme = DarkTheme, Rules = Rules.Select(r => new Rule { Path = r.Path, Enabled = r.Enabled, Force = r.Force }).ToList() };
+                Continuous = Continuous, DarkTheme = DarkTheme, Rules = Rules.Select(r => new Rule { Path = r.Path, Enabled = r.Enabled, Force = r.Force, RiskAccepted = r.RiskAccepted, ImportantReason = r.ImportantReason }).ToList() };
         }
         public void Validate()
         {
@@ -43,7 +45,7 @@ namespace StartupTidy
             DurationMinutes = Math.Max(1, Math.Min(60, DurationMinutes));
             Rules = (Rules ?? new List<Rule>()).Where(r => r != null && !String.IsNullOrWhiteSpace(r.Path)).ToList();
             var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var r in Rules) { r.Path = Safety.Normalize(r.Path); if (!unique.Add(r.Path)) throw new InvalidDataException("Повторяющийся путь в настройках."); }
+            foreach (var r in Rules) { r.Path = Safety.Normalize(r.Path); if (!unique.Add(r.Path)) throw new InvalidDataException("Повторяющийся путь в настройках."); if (Safety.RuleImportance(r) != null && !r.RiskAccepted) r.Enabled = false; }
         }
     }
     public static class Storage
@@ -105,36 +107,55 @@ namespace StartupTidy
         {
             return path.StartsWith(directory.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase) || String.Equals(path, directory, StringComparison.OrdinalIgnoreCase);
         }
-        public static string Rejection(string path)
+        public static string HardRejection(string path)
         {
             try
             {
                 path = Normalize(path);
                 if (!String.Equals(System.IO.Path.GetExtension(path), ".exe", StringComparison.OrdinalIgnoreCase)) return "Выбери исполняемый файл .exe.";
                 if (String.Equals(path, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase)) return "Утилита не может закрывать саму себя.";
-                if (Inside(path, Environment.GetFolderPath(Environment.SpecialFolder.Windows)) || ProtectedNames.Contains(System.IO.Path.GetFileName(path)))
-                    return "Этот системный или защищённый процесс нельзя добавить.";
                 return null;
             }
             catch { return "Некорректный путь к файлу."; }
         }
-        public static bool TryIdentity(Process process, out string path)
+        public static string Importance(string path)
+        {
+            try
+            {
+                if (Inside(Normalize(path), Environment.GetFolderPath(Environment.SpecialFolder.Windows))) return "Файл находится в папке Windows и может быть важен для системы.";
+                if (ProtectedNames.Contains(System.IO.Path.GetFileName(path))) return "Известный системный или защитный процесс: его закрытие может нарушить работу системы или защиты.";
+            }
+            catch { return "Не удалось проверить путь."; }
+            return null;
+        }
+        public static string RuleImportance(Rule rule)
+        { return Importance(rule.Path) ?? (String.IsNullOrWhiteSpace(rule.ImportantReason) ? null : rule.ImportantReason); }
+        public static bool RuleAllowed(Rule rule)
+        { return rule.Enabled && HardRejection(rule.Path) == null && (RuleImportance(rule) == null || rule.RiskAccepted); }
+        public static string Rejection(string path) { return HardRejection(path) ?? Importance(path); }
+        public static bool TryIdentity(Process process, out string path) { return TryIdentity(process, out path, false); }
+        public static bool TryIdentity(Process process, out string path, bool allowImportant)
         {
             path = null; IntPtr handle = IntPtr.Zero, token = IntPtr.Zero;
             try
             {
-                if (process.Id == Process.GetCurrentProcess().Id || process.SessionId != Session) return false;
+                if (process.Id == Process.GetCurrentProcess().Id && !allowImportant) return false;
                 handle = OpenProcess(0x1000, false, process.Id);
-                if (handle == IntPtr.Zero || !OpenProcessToken(handle, 8, out token)) return false;
-                using (var identity = new WindowsIdentity(token)) if (identity.User == null || identity.User.Value != Sid) return false;
+                if (handle == IntPtr.Zero) return false;
+                if (!allowImportant)
+                {
+                    if (process.SessionId != Session || !OpenProcessToken(handle, 8, out token)) return false;
+                    using (var identity = new WindowsIdentity(token)) if (identity.User == null || identity.User.Value != Sid) return false;
+                }
                 var buffer = new StringBuilder(32768); int size = buffer.Capacity;
                 if (!QueryFullProcessImageName(handle, 0, buffer, ref size)) return false;
-                path = Normalize(buffer.ToString()); return Rejection(path) == null;
+                path = Normalize(buffer.ToString()); return allowImportant || Rejection(path) == null;
             }
             catch { return false; }
             finally { if (token != IntPtr.Zero) CloseHandle(token); if (handle != IntPtr.Zero) CloseHandle(handle); }
         }
     }
+
     public class Engine
     {
         readonly Action<string> log;
@@ -142,7 +163,7 @@ namespace StartupTidy
         public Engine(Action<string> logger) { log = logger; }
         public void Scan(Settings settings, CancellationToken cancellation)
         {
-            var rules = settings.Rules.Where(r => r.Enabled && Safety.Rejection(r.Path) == null)
+            var rules = settings.Rules.Where(Safety.RuleAllowed)
                 .GroupBy(r => r.Path, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
             if (rules.Count == 0) return;
             var alive = new HashSet<string>();
@@ -154,7 +175,9 @@ namespace StartupTidy
                     try
                     {
                         string path; Rule rule;
-                        if (!Safety.TryIdentity(process, out path) || !rules.TryGetValue(path, out rule)) continue;
+                        if (!Safety.TryIdentity(process, out path, true) || !rules.TryGetValue(path, out rule)) continue;
+                        string verifiedPath;
+                        if (!rule.RiskAccepted && !Safety.TryIdentity(process, out verifiedPath)) continue;
                         string identity = process.Id + ":" + process.StartTime.ToUniversalTime().Ticks;
                         alive.Add(identity); DateTime last;
                         if (attempted.TryGetValue(identity, out last) && DateTime.UtcNow - last < TimeSpan.FromSeconds(60)) continue;
@@ -172,7 +195,7 @@ namespace StartupTidy
                         {
                             // Revalidate the same Process object before termination; never kill by a stale PID alone.
                             string currentPath;
-                            if (Safety.TryIdentity(process, out currentPath) && String.Equals(currentPath, path, StringComparison.OrdinalIgnoreCase))
+                            if (Safety.TryIdentity(process, out currentPath, rule.RiskAccepted) && String.Equals(currentPath, path, StringComparison.OrdinalIgnoreCase))
                             {
                                 process.Kill();
                                 log((process.WaitForExit(2000) ? "Завершено принудительно: " : "Отправлена команда завершения: ") + path);
@@ -208,6 +231,7 @@ namespace StartupTidy
         readonly NumericUpDown interval = new NumericUpDown(), duration = new NumericUpDown();
         readonly CheckBox auto = new CheckBox(), continuous = new CheckBox(), darkTheme = new CheckBox();
         readonly Label status = new Label(), count = new Label();
+        readonly ComboBox ruleView = new ThemedComboBox();
         readonly Button start = new Button(), once = new Button();
         readonly NotifyIcon tray = new NotifyIcon();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
@@ -283,13 +307,15 @@ namespace StartupTidy
             var logs = new TabPage("Журнал") { Padding = new Padding(12), BackColor = Color.White };
             tabs.TabPages.AddRange(new[] { programs, options, logs }); root.Controls.Add(tabs, 0, 2);
             rules.View = View.Details; rules.CheckBoxes = true; rules.FullRowSelect = true; rules.MultiSelect = true; rules.Dock = DockStyle.Fill;
-            rules.HideSelection = false; rules.Columns.Add("Программа", 200); rules.Columns.Add("Закрытие", 170); rules.Columns.Add("Полный путь к .exe", 490);
+            rules.HideSelection = false; rules.Columns.Add("Программа", 200); rules.Columns.Add("Закрытие", 170); rules.Columns.Add("Важность", 170); rules.Columns.Add("Полный путь к .exe", 490); rules.ShowItemToolTips = true;
             rules.ItemChecked += delegate(object sender, ItemCheckedEventArgs e) {
                 // Native ListView construction can report temporary items without a Rule.
                 // Only persist an actual change to the one bound item after initialization.
                 if (rebuilding || !initialized || e.Item == null) return;
                 var rule = e.Item.Tag as Rule;
                 if (rule == null || !settings.Rules.Contains(rule) || rule.Enabled == e.Item.Checked) return;
+                if (e.Item.Checked && Safety.RuleImportance(rule) != null && !ApproveImportant(new[] { rule }))
+                { rebuilding = true; try { e.Item.Checked = false; } finally { rebuilding = false; } return; }
                 CancelPending(); rule.Enabled = e.Item.Checked; SaveQuietly(); UpdateStatus();
             };
             var actions = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 100, Padding = new Padding(0, 10, 0, 0) };
@@ -301,8 +327,20 @@ namespace StartupTidy
             actions.Controls.Add(ActionButton("Удалить выбранные", delegate { ApplySelected(null, null, true); }));
             rules.ItemSelectionChanged += delegate { if (!rebuilding) UpdateCount(); };
             rules.KeyDown += delegate(object sender, KeyEventArgs e) { if (e.Control && e.KeyCode == Keys.A) { foreach (ListViewItem item in rules.Items) item.Selected = true; e.SuppressKeyPress = true; } };
-            count.Dock = DockStyle.Top; count.Height = 50;
-            programs.Controls.Add(rules); programs.Controls.Add(actions); programs.Controls.Add(count);
+            var views = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 38 };
+            views.Controls.Add(new Label { Text = "Раздел:", AutoSize = true, Margin = new Padding(0, 7, 8, 0) });
+            ruleView.DropDownStyle = ComboBoxStyle.DropDownList; ruleView.Width = 320;
+            ruleView.Items.AddRange(new object[] { "Все правила", "Обычные программы", "Важные процессы — с предупреждением" }); ruleView.SelectedIndex = 0;
+            ruleView.SelectedIndexChanged += delegate { if (initialized) RefreshRules(); };
+            views.Controls.Add(ruleView);
+            var riskMenu = new ContextMenuStrip();
+            riskMenu.Items.Add("Показать важные процессы", null, delegate { ruleView.SelectedIndex = 2; });
+            riskMenu.Items.Add("Разрешить выбранные важные", null, delegate { ApplySelected(true, null, false); });
+            riskMenu.Items.Add("Отозвать разрешение у выбранных", null, delegate { RevokeSelected(); });
+            var riskButton = ActionButton("Важные процессы…", delegate(object sender, EventArgs args) { Theme.ApplyMenu(riskMenu, settings.DarkTheme); riskMenu.Show((Control)sender, 0, ((Control)sender).Height); });
+            views.Controls.Add(riskButton);
+            count.Dock = DockStyle.Top; count.Height = 68;
+            programs.Controls.Add(rules); programs.Controls.Add(actions); programs.Controls.Add(count); programs.Controls.Add(views);
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 9, AutoScroll = true };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 330)); layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             for (int i = 0; i < 8; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, i == 0 ? 58 : 46));
@@ -365,9 +403,12 @@ namespace StartupTidy
                 rules.Items.Clear();
                 foreach (var rule in settings.Rules)
                 {
+                    bool important = Safety.RuleImportance(rule) != null;
+                    if ((ruleView.SelectedIndex == 1 && important) || (ruleView.SelectedIndex == 2 && !important)) continue;
                     var item = new ListViewItem(System.IO.Path.GetFileName(rule.Path)) { Tag = rule, Checked = rule.Enabled };
-                    item.SubItems.Add(rule.Force ? "Принудительное" : "Обычное"); item.SubItems.Add(rule.Path);
-                    if (Safety.Rejection(rule.Path) != null) { item.ForeColor = settings.DarkTheme ? Color.FromArgb(255,161,151) : Color.DarkRed; item.ToolTipText = "Защищён: правило будет пропущено"; }
+                    item.SubItems.Add(rule.Force ? "Принудительное" : "Обычное");
+                    item.SubItems.Add(important ? (rule.RiskAccepted ? "Важный: разрешён" : "Важный: заблокирован") : "Обычный"); item.SubItems.Add(rule.Path);
+                    if (important) { item.ForeColor = settings.DarkTheme ? Color.FromArgb(255,196,132) : Color.FromArgb(143,76,23); item.ToolTipText = Safety.RuleImportance(rule) + " Без явного разрешения правило не выполняется."; }
                     rules.Items.Add(item); item.Selected = selected.Contains(rule);
                 }
             }
@@ -378,6 +419,7 @@ namespace StartupTidy
         {
             count.Text = settings.Rules.Count == 0 ? "Список пуст. Добавь программу кнопками внизу." :
                 "Программ: " + settings.Rules.Count + "   Выбрано: " + rules.SelectedItems.Count + "   Галочка включает правило.";
+            if (ruleView.SelectedIndex == 2) count.Text += "\nВнимание: эти процессы могут быть важны для работы системы. Закрытие может вызвать сбой или потерю данных.";
             count.Text += "\nCtrl + щелчок — выбрать несколько; Shift + щелчок — диапазон; Ctrl + A — выбрать все.";
         }
         List<Rule> SelectedRules()
@@ -386,6 +428,7 @@ namespace StartupTidy
         {
             var selected = SelectedRules(); if (selected.Count == 0) return;
             if (!remove && !enabled.HasValue && !force.HasValue) return;
+            if (!remove && enabled == true && !ApproveImportant(selected)) return;
             CancelPending();
             foreach (var rule in selected)
             {
@@ -394,26 +437,49 @@ namespace StartupTidy
             }
             RefreshRules(); SaveQuietly();
         }
-        internal int AddPaths(IEnumerable<string> paths, out List<string> skipped)
+        bool ApproveImportant(IEnumerable<Rule> rulesToApprove)
+        {
+            var important = rulesToApprove.Where(r => Safety.RuleImportance(r) != null && !r.RiskAccepted).ToList();
+            if (important.Count == 0) return true;
+            var answer = MessageBox.Show(this, "Выбрано важных процессов: " + important.Count + ".\n\nЭти процессы могут быть важны для работы системы или её защиты. Их закрытие может вызвать сбой Windows, завершение сеанса или потерю несохранённых данных. Разрешение действует и при будущих запусках наблюдения, для всех доступных экземпляров выбранного EXE.\n\nРазрешить закрытие?", "Важные процессы — предупреждение", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes) return false;
+            foreach (var rule in important) rule.RiskAccepted = true;
+            return true;
+        }
+        void RevokeSelected()
+        {
+            CancelPending();
+            foreach (var rule in SelectedRules().Where(r => Safety.RuleImportance(r) != null)) { rule.RiskAccepted = false; rule.Enabled = false; }
+            RefreshRules(); SaveQuietly();
+        }
+        internal int AddPaths(IEnumerable<string> paths, out List<string> skipped) { return AddPaths(paths, out skipped, null); }
+        internal int AddPaths(IEnumerable<string> paths, out List<string> skipped, IDictionary<string,string> observations)
         {
             skipped = new List<string>(); int added = 0;
             var newlyAdded = new HashSet<Rule>();
             var existing = new HashSet<string>(settings.Rules.Select(r => r.Path), StringComparer.OrdinalIgnoreCase);
             foreach (string path in paths)
             {
-                string rejection = Safety.Rejection(path);
+                string rejection = Safety.HardRejection(path);
                 if (rejection != null) { skipped.Add(path + " — " + rejection); continue; }
                 string normalized = Safety.Normalize(path);
-                if (!File.Exists(normalized)) { skipped.Add(path + " — файл не найден."); continue; }
-                if (!existing.Add(normalized)) { skipped.Add(path + " — уже в списке."); continue; }
-                var rule = new Rule { Path = normalized }; settings.Rules.Add(rule); newlyAdded.Add(rule); added++;
+                string observedReason = null;
+                bool observed = observations != null && observations.TryGetValue(normalized, out observedReason);
+                if (!File.Exists(normalized) && !observed) { skipped.Add(path + " — файл не найден или недоступен."); continue; }
+                if (!existing.Add(normalized))
+                {
+                    var previous = settings.Rules.First(r => String.Equals(r.Path, normalized, StringComparison.OrdinalIgnoreCase));
+                    if (observedReason != null) { previous.ImportantReason = observedReason; if (!previous.RiskAccepted) previous.Enabled = false; }
+                    skipped.Add(path + " — уже в списке."); continue;
+                }
+                var rule = new Rule { Path = normalized, ImportantReason = observedReason ?? "", Enabled = Safety.Importance(normalized) == null && observedReason == null }; settings.Rules.Add(rule); newlyAdded.Add(rule); added++;
             }
-            if (added > 0) { RefreshRules(); foreach (ListViewItem item in rules.Items) item.Selected = newlyAdded.Contains(item.Tag as Rule); SaveQuietly(); }
+            if (added > 0 || observations != null) { RefreshRules(); foreach (ListViewItem item in rules.Items) item.Selected = newlyAdded.Contains(item.Tag as Rule); SaveQuietly(); }
             return added;
         }
-        void AddMany(IEnumerable<string> paths)
+        void AddMany(IEnumerable<string> paths, IDictionary<string,string> observations = null)
         {
-            List<string> skipped; int added = AddPaths(paths, out skipped);
+            List<string> skipped; int added = AddPaths(paths, out skipped, observations);
             if (skipped.Count > 0) MessageBox.Show(this, "Добавлено: " + added + ". Пропущено: " + skipped.Count + ".\n\n" +
                 String.Join("\n", skipped.Take(10)) + (skipped.Count > 10 ? "\n…" : ""), "Добавление программ", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -422,9 +488,14 @@ namespace StartupTidy
             using (var dialog = new OpenFileDialog { Filter = "Программы Windows (*.exe)|*.exe", Title = "Какие программы закрывать?", CheckFileExists = true, Multiselect = true })
                 if (dialog.ShowDialog(this) == DialogResult.OK) AddMany(dialog.FileNames);
         }
+        internal ProcessPicker CreateProcessPicker()
+        { return new ProcessPicker(null, settings.Rules.Select(r => r.Path)); }
         void PickRunning()
         {
-            using (var dialog = new ProcessPicker()) { Theme.Apply(dialog, settings.DarkTheme); dialog.HandleCreated += delegate { Theme.TitleBar(dialog, settings.DarkTheme); }; if (dialog.ShowDialog(this) == DialogResult.OK) AddMany(dialog.SelectedPaths); }
+            using (var dialog = CreateProcessPicker()) { Theme.Apply(dialog, settings.DarkTheme); dialog.HandleCreated += delegate { Theme.TitleBar(dialog, settings.DarkTheme); }; if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    AddMany(dialog.SelectedPaths, dialog.ImportantPaths);
+                } }
         }
         void EditRule()
         {
@@ -447,7 +518,7 @@ namespace StartupTidy
         public void StartWatching()
         {
             if (watching || busy) return;
-            if (!settings.Rules.Any(r => r.Enabled && Safety.Rejection(r.Path) == null))
+            if (!settings.Rules.Any(Safety.RuleAllowed))
             { Log("Наблюдение не запущено: нет включённых правил."); return; }
             cancellation.Dispose(); cancellation = new CancellationTokenSource();
             watching = true; end = DateTime.UtcNow.AddMinutes(settings.DurationMinutes); nextScan = DateTime.MinValue;
@@ -506,21 +577,32 @@ namespace StartupTidy
     {
         readonly ListView list = new ThemedListView();
         public List<string> SelectedPaths = new List<string>();
-        public ProcessPicker() : this(null) { }
-        internal ProcessPicker(IEnumerable<string> candidates)
+        public readonly Dictionary<string,string> ImportantPaths = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+        readonly HashSet<string> existingPaths;
+        int hiddenCount;
+        public ProcessPicker() : this(null, null) { }
+        internal ProcessPicker(IEnumerable<string> candidates) : this(candidates, null) { }
+        internal ProcessPicker(IEnumerable<string> candidates, IEnumerable<string> alreadyAdded)
         {
+            existingPaths = new HashSet<string>((alreadyAdded ?? Enumerable.Empty<string>()).Select(Safety.Normalize), StringComparer.OrdinalIgnoreCase);
             Text = "Выбери запущенную программу"; Font = new Font("Segoe UI", 10); ClientSize = new Size(860, 460);
             StartPosition = FormStartPosition.CenterParent; MinimumSize = new Size(650, 400);
             list.View = View.Details; list.FullRowSelect = true; list.MultiSelect = true; list.Dock = DockStyle.Fill;
-            list.Columns.Add("Программа", 190); list.Columns.Add("Путь", 630);
-            var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            list.Columns.Add("Процесс", 160); list.Columns.Add("PID", 65); list.Columns.Add("Статус / предупреждение", 250); list.Columns.Add("Полный путь", 600); list.ShowItemToolTips = true;
             if (candidates == null)
             {
                 foreach (var process in Process.GetProcesses()) using (process)
-                { string path; if (Safety.TryIdentity(process, out path)) paths.Add(path); }
+                {
+                    string path = null; string name;
+                    try { name = process.ProcessName; } catch { name = "Недоступный процесс"; }
+                    Safety.TryIdentity(process, out path, true);
+                    string reason = path == null ? "Windows не предоставила путь; добавить правило нельзя." : Safety.Rejection(path);
+                    string ownedPath;
+                    if (reason == null && !Safety.TryIdentity(process, out ownedPath)) reason = "Другой пользователь/сеанс или владелец недоступен для проверки. Процесс может быть важен.";
+                    AddProcessRow(name, process.Id.ToString(), path, reason);
+                }
             }
-            else foreach (string path in candidates) paths.Add(path);
-            foreach (string path in paths) list.Items.Add(new ListViewItem(new[] { System.IO.Path.GetFileName(path), path }) { Tag = path });
+            else foreach (string path in candidates.Distinct(StringComparer.OrdinalIgnoreCase)) AddProcessRow(System.IO.Path.GetFileName(path), "—", path, Safety.Importance(path));
             list.Sorting = SortOrder.Ascending;
             var panel = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 55, Padding = new Padding(10) };
             var add = new Button { Text = "Добавить выбранные (0)", AutoSize = true, Enabled = false };
@@ -529,10 +611,26 @@ namespace StartupTidy
             add.Click += delegate { Choose(); };
             var cancel = new Button { Text = "Отмена", AutoSize = true, DialogResult = DialogResult.Cancel };
             panel.Controls.Add(add); panel.Controls.Add(cancel); CancelButton = cancel; list.DoubleClick += delegate { Choose(); };
-            var note = new Label { Text = "Выделение: Ctrl + щелчок, Shift + щелчок, Ctrl + A. Затем нажми «Добавить выбранные».\nПоказаны доступные приложения текущего пользователя. Системные процессы скрыты.", Height = 55, Dock = DockStyle.Top, Padding = new Padding(8) };
+            var note = new Label { Text = "Выделение: Ctrl + щелчок, Shift + щелчок, Ctrl + A. Затем нажми «Добавить выбранные».\nВажные процессы добавляются отдельно и выключены до подтверждения. Уже добавленные скрыты: " + hiddenCount + ". Остальные видны, включая важные и недоступные. Для недоступного пути правило создать нельзя.", Height = 76, Dock = DockStyle.Top, Padding = new Padding(8) };
             Controls.Add(list); Controls.Add(panel); Controls.Add(note);
         }
-        void Choose() { if (list.SelectedItems.Count == 0) return; SelectedPaths = list.SelectedItems.Cast<ListViewItem>().Select(i => (string)i.Tag).ToList(); DialogResult = DialogResult.OK; Close(); }
+        void AddProcessRow(string name, string pid, string path, string reason)
+        {
+            if (path != null && existingPaths.Contains(Safety.Normalize(path))) { hiddenCount++; return; }
+            var item = new ListViewItem(new[] { name, pid, reason ?? "Обычный процесс", path ?? "Путь недоступен" }) { Tag = path, ToolTipText = reason ?? path };
+            if (reason != null) item.ForeColor = Color.FromArgb(170,100,30);
+            if (path != null && reason != null && Safety.HardRejection(path) == null) ImportantPaths[path] = reason;
+            list.Items.Add(item);
+        }
+        void Choose()
+        {
+            if (list.SelectedItems.Count == 0) return;
+            SelectedPaths = list.SelectedItems.Cast<ListViewItem>().Select(i => i.Tag as string).Where(p => p != null).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            int unavailable = list.SelectedItems.Cast<ListViewItem>().Count(i => i.Tag == null);
+            if (unavailable > 0) MessageBox.Show(this, "Для " + unavailable + " выбранных процессов Windows не предоставила путь. Они видны, но добавить надёжное правило по ним нельзя. Остальные выбранные процессы будут добавлены.", "Путь к процессу недоступен", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (SelectedPaths.Count == 0) return;
+            DialogResult = DialogResult.OK; Close();
+        }
     }
     static class Program
     {
